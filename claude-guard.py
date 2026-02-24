@@ -102,6 +102,8 @@ def show_approval_dialog(summary: str, risk: str, tool_name: str,
 # --- Menu Bar App ---
 
 class ClaudeGuardApp(rumps.App):
+    AUTONOMOUS_FLAG = os.path.join(SCRIPT_DIR, "autonomous.flag")
+
     def __init__(self):
         super().__init__(
             "Claude Guard",
@@ -116,6 +118,7 @@ class ClaudeGuardApp(rumps.App):
         self.show_low_risk = self.config.get("ui", {}).get("show_low_risk_in_menu", False)
 
         # Build initial menu
+        self._update_title()
         self._rebuild_menu()
 
         # Start socket listener in background thread
@@ -151,6 +154,13 @@ class ClaudeGuardApp(rumps.App):
 
         self.menu.add(rumps.separator)
 
+        # Autonomous mode toggle
+        autonomous = self._is_autonomous()
+        auto_label = "✅ 自律実行モード (ON)" if autonomous else "⬜ 自律実行モード (OFF)"
+        self.menu.add(rumps.MenuItem(auto_label, callback=self._toggle_autonomous))
+
+        self.menu.add(rumps.separator)
+
         # Settings
         self.menu.add(rumps.MenuItem("設定を開く...", callback=self._open_config))
         self.menu.add(rumps.MenuItem("履歴をクリア", callback=self._clear_history))
@@ -168,6 +178,24 @@ class ClaudeGuardApp(rumps.App):
             self.history = self.history[-100:]
 
         self._rebuild_menu()
+
+    def _is_autonomous(self) -> bool:
+        """Check if autonomous mode is active."""
+        return os.path.exists(self.AUTONOMOUS_FLAG)
+
+    def _toggle_autonomous(self, _):
+        """Toggle autonomous mode on/off."""
+        if self._is_autonomous():
+            os.unlink(self.AUTONOMOUS_FLAG)
+        else:
+            with open(self.AUTONOMOUS_FLAG, "w") as f:
+                f.write(str(time.time()))
+        self._update_title()
+        self._rebuild_menu()
+
+    def _update_title(self):
+        """Update menu bar icon based on mode."""
+        self.title = "🛡⚡" if self._is_autonomous() else "🛡"
 
     def _open_config(self, _):
         """Open config.json in default editor."""

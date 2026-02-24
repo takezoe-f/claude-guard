@@ -57,6 +57,11 @@ def block(reason: str):
     sys.exit(2)
 
 
+def is_autonomous_mode() -> bool:
+    """Check if autonomous mode is active (flag file exists)."""
+    return os.path.exists(os.path.join(SCRIPT_DIR, "autonomous.flag"))
+
+
 def main():
     # Read hook input from stdin
     try:
@@ -73,6 +78,17 @@ def main():
         approve()
 
     config = load_config()
+
+    # Autonomous mode: auto-approve everything, just log
+    if is_autonomous_mode():
+        risk, summary = classify_tool(tool_name, tool_input)
+        if is_daemon_running():
+            msg = create_message(MSG_LOG, tool_name, summary + " (自律実行)", risk, tool_input)
+            try:
+                send_to_daemon(msg, timeout=1.0)
+            except Exception:
+                pass
+        approve()
 
     # Check if tool is in auto-approve list
     auto_approve = config.get("auto_approve_tools", [])

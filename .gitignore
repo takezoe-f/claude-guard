@@ -2,4 +2,5 @@ __pycache__/
 *.pyc
 *.pyo
 guard.sock
+autonomous.flag
 .DS_Store
