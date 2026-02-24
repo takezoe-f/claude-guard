@@ -63,6 +63,16 @@ def is_autonomous_mode() -> bool:
 
 
 def main():
+    try:
+        _main()
+    except SystemExit:
+        raise
+    except Exception:
+        # Any uncaught exception → fail-open (never block Claude Code due to our bugs)
+        approve()
+
+
+def _main():
     # Read hook input from stdin
     try:
         raw = sys.stdin.read()
@@ -133,11 +143,8 @@ def main():
 
     # Check if daemon is running
     if not is_daemon_running():
-        fail_mode = behavior.get("fail_mode", "open")
-        if fail_mode == "open":
-            approve()
-        else:
-            block("Claude Guard デーモンが起動していません")
+        # Daemon not running → fail-open (never block without a daemon to ask)
+        approve()
 
     # Send approval request to daemon
     # Use a long timeout to accommodate deferred decisions from menu bar
@@ -153,11 +160,8 @@ def main():
     response = send_to_daemon(msg, timeout=socket_timeout)
 
     if response is None:
-        # Daemon didn't respond, use timeout action
-        if timeout_action == "approve":
-            approve()
-        else:
-            block(f"Claude Guard: タイムアウト（{timeout}秒）- 自動拒否")
+        # Daemon didn't respond → fail-open
+        approve()
 
     if response.get("approved", False):
         approve()

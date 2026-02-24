@@ -52,18 +52,23 @@ def show_approval_dialog(summary: str, risk: str, tool_name: str,
                          timeout_seconds: int) -> str:
     """Show a native macOS approval dialog using osascript.
 
+    Uses 'tell current application' instead of 'tell application "System Events"'
+    to avoid freezing issues. Falls back to DECISION_TIMEOUT on any error
+    (crash, force-quit, kill) to maintain fail-open behavior.
+
     Returns one of: DECISION_APPROVE, DECISION_DENY, DECISION_DEFER, DECISION_TIMEOUT.
     """
     icon = "caution" if risk == RISK_HIGH else "note"
 
-    # Escape double quotes in summary for AppleScript
-    safe_summary = summary.replace('"', '\\"').replace("'", "\\'")
+    # Escape special characters for AppleScript string
+    safe_summary = (summary
+                    .replace("\\", "\\\\")
+                    .replace('"', '\\"'))
 
     risk_label = {"high": "高リスク", "medium": "中リスク", "low": "低リスク"}.get(risk, risk)
 
     applescript = f'''
-    tell application "System Events"
-        activate
+    tell current application
         set dialogResult to display dialog "【{risk_label}】{safe_summary}" ¬
             buttons {{"拒否", "後で", "承認"}} ¬
             default button "承認" ¬
@@ -87,21 +92,26 @@ def show_approval_dialog(summary: str, risk: str, tool_name: str,
         output = result.stdout.strip()
 
         if result.returncode != 0:
-            # User hit Escape or dialog was dismissed
-            return DECISION_DENY
-
-        if output == "timeout":
+            # Dialog was force-quit, killed, or crashed.
+            # Treat as timeout (fail-open) rather than explicit deny.
             return DECISION_TIMEOUT
+
         if output == "承認":
             return DECISION_APPROVE
         if output == "後で":
             return DECISION_DEFER
+        if output == "拒否":
+            return DECISION_DENY
+        if output == "timeout":
+            return DECISION_TIMEOUT
 
-        return DECISION_DENY
+        # Unknown output → fail-open
+        return DECISION_TIMEOUT
 
     except subprocess.TimeoutExpired:
         return DECISION_TIMEOUT
     except Exception:
+        # Any error (crash, signal, etc.) → fail-open
         return DECISION_TIMEOUT
 
 
