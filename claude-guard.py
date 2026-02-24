@@ -474,6 +474,33 @@ class ClaudeGuardApp(rumps.App):
             return False, "メニューから拒否されました"
 
 
+def _preflight_check():
+    """Verify dependencies and environment before starting.
+
+    If a fatal error is found, log it and exit 0 (successful exit)
+    so KeepAlive does NOT restart us into a crash loop.
+    Exit code 1 (error) would trigger KeepAlive restart.
+    """
+    errors = []
+
+    try:
+        import rumps  # noqa: F401
+    except ImportError:
+        errors.append("rumps がインストールされていません (pip3 install rumps)")
+
+    socket_dir = os.path.dirname(SOCKET_PATH)
+    if not os.path.isdir(socket_dir):
+        errors.append(f"ディレクトリが存在しません: {socket_dir}")
+
+    if errors:
+        for e in errors:
+            print(f"[Claude Guard] 起動エラー: {e}", file=sys.stderr)
+        print("[Claude Guard] 致命的エラーのため終了します（再起動ループ防止）",
+              file=sys.stderr)
+        sys.exit(0)  # exit 0 = KeepAlive won't restart
+
+
 if __name__ == "__main__":
+    _preflight_check()
     app = ClaudeGuardApp()
     app.run()
