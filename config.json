@@ -1,0 +1,23 @@
+{
+  "behavior": {
+    "fail_mode": "open",
+    "medium_risk_timeout_seconds": 15,
+    "high_risk_timeout_seconds": 30,
+    "timeout_action_medium": "approve",
+    "timeout_action_high": "deny"
+  },
+  "auto_approve_tools": [
+    "Read", "Glob", "Grep", "WebSearch", "WebFetch",
+    "TaskList", "TaskGet", "TaskOutput", "ToolSearch"
+  ],
+  "always_require_approval_tools": [
+    "mcp__freee-mcp__freee_api_post",
+    "mcp__freee-mcp__freee_api_put",
+    "mcp__freee-mcp__freee_api_delete",
+    "mcp__freee-mcp__freee_api_patch"
+  ],
+  "ui": {
+    "show_low_risk_in_menu": false,
+    "max_menu_items": 15
+  }
+}
