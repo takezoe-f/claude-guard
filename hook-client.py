@@ -140,13 +140,17 @@ def main():
             block("Claude Guard デーモンが起動していません")
 
     # Send approval request to daemon
+    # Use a long timeout to accommodate deferred decisions from menu bar
+    deferred_timeout = behavior.get("deferred_timeout_seconds", 600)
+    socket_timeout = float(max(timeout, deferred_timeout) + 10)
+
     request_id = str(uuid.uuid4())[:8]
     msg = create_message(
         MSG_REQUEST_APPROVAL, tool_name, summary, risk,
         tool_input, request_id,
     )
 
-    response = send_to_daemon(msg, timeout=float(timeout + 2))
+    response = send_to_daemon(msg, timeout=socket_timeout)
 
     if response is None:
         # Daemon didn't respond, use timeout action

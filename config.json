@@ -4,7 +4,8 @@
     "medium_risk_timeout_seconds": 15,
     "high_risk_timeout_seconds": 30,
     "timeout_action_medium": "approve",
-    "timeout_action_high": "deny"
+    "timeout_action_high": "deny",
+    "deferred_timeout_seconds": 600
   },
   "auto_approve_tools": [
     "Read", "Glob", "Grep", "WebSearch", "WebFetch",

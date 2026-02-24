@@ -42,16 +42,22 @@ def load_config() -> dict:
 
 # --- osascript Dialog ---
 
+DECISION_APPROVE = "approve"
+DECISION_DENY = "deny"
+DECISION_DEFER = "defer"
+DECISION_TIMEOUT = "timeout"
+
+
 def show_approval_dialog(summary: str, risk: str, tool_name: str,
-                         timeout_seconds: int) -> tuple[bool, str]:
+                         timeout_seconds: int) -> str:
     """Show a native macOS approval dialog using osascript.
 
-    Returns (approved: bool, reason: str).
+    Returns one of: DECISION_APPROVE, DECISION_DENY, DECISION_DEFER, DECISION_TIMEOUT.
     """
     icon = "caution" if risk == RISK_HIGH else "note"
 
     # Escape double quotes in summary for AppleScript
-    safe_summary = summary.replace('"', '\\"').replace("'", "'")
+    safe_summary = summary.replace('"', '\\"').replace("'", "\\'")
 
     risk_label = {"high": "高リスク", "medium": "中リスク", "low": "低リスク"}.get(risk, risk)
 
@@ -59,9 +65,8 @@ def show_approval_dialog(summary: str, risk: str, tool_name: str,
     tell application "System Events"
         activate
         set dialogResult to display dialog "【{risk_label}】{safe_summary}" ¬
-            buttons {{"拒否", "承認"}} ¬
+            buttons {{"拒否", "後で", "承認"}} ¬
             default button "承認" ¬
-            cancel button "拒否" ¬
             with title "Claude Guard - {tool_name}" ¬
             with icon {icon} ¬
             giving up after {timeout_seconds}
@@ -82,21 +87,22 @@ def show_approval_dialog(summary: str, risk: str, tool_name: str,
         output = result.stdout.strip()
 
         if result.returncode != 0:
-            # User clicked "拒否" (cancel button)
-            return False, "ユーザーにより拒否されました"
+            # User hit Escape or dialog was dismissed
+            return DECISION_DENY
 
         if output == "timeout":
-            return None, "timeout"  # Let caller handle timeout action
-
+            return DECISION_TIMEOUT
         if output == "承認":
-            return True, "ユーザーにより承認されました"
+            return DECISION_APPROVE
+        if output == "後で":
+            return DECISION_DEFER
 
-        return False, "ユーザーにより拒否されました"
+        return DECISION_DENY
 
     except subprocess.TimeoutExpired:
-        return None, "timeout"
-    except Exception as e:
-        return None, f"ダイアログエラー: {e}"
+        return DECISION_TIMEOUT
+    except Exception:
+        return DECISION_TIMEOUT
 
 
 # --- Menu Bar App ---
@@ -116,6 +122,16 @@ class ClaudeGuardApp(rumps.App):
         self.pending_count = 0
         self.max_menu_items = self.config.get("ui", {}).get("max_menu_items", 15)
         self.show_low_risk = self.config.get("ui", {}).get("show_low_risk_in_menu", False)
+        self.deferred_timeout = self.config.get("behavior", {}).get(
+            "deferred_timeout_seconds", 600,
+        )
+
+        # Deferred requests: request_id -> {
+        #   "summary": str, "risk": str, "tool_name": str,
+        #   "event": threading.Event, "decision": str|None, "time": float
+        # }
+        self.deferred_requests = {}
+        self._deferred_lock = threading.Lock()
 
         # Build initial menu
         self._update_title()
@@ -129,7 +145,36 @@ class ClaudeGuardApp(rumps.App):
         """Rebuild the menu bar dropdown."""
         self.menu.clear()
 
-        # Header
+        # Deferred requests section (shown at top when items exist)
+        with self._deferred_lock:
+            deferred_items = list(self.deferred_requests.items())
+
+        if deferred_items:
+            deferred_header = rumps.MenuItem(f"--- 保留中 ({len(deferred_items)}件) ---")
+            deferred_header.set_callback(None)
+            self.menu.add(deferred_header)
+
+            for req_id, req in deferred_items:
+                # Create parent item with submenu for approve/deny
+                risk_icon = "⚠️ " if req["risk"] == RISK_HIGH else ""
+                parent = rumps.MenuItem(f"🔶 {risk_icon}{req['summary']}")
+                parent.set_callback(None)
+
+                approve_item = rumps.MenuItem(
+                    "✅ 承認する",
+                    callback=self._make_deferred_callback(req_id, DECISION_APPROVE),
+                )
+                deny_item = rumps.MenuItem(
+                    "❌ 拒否する",
+                    callback=self._make_deferred_callback(req_id, DECISION_DENY),
+                )
+                parent.add(approve_item)
+                parent.add(deny_item)
+                self.menu.add(parent)
+
+            self.menu.add(rumps.separator)
+
+        # History header
         header = rumps.MenuItem("--- 最近のツール実行 ---")
         header.set_callback(None)
         self.menu.add(header)
@@ -147,8 +192,9 @@ class ClaudeGuardApp(rumps.App):
 
         self.menu.add(rumps.separator)
 
-        # Pending count
-        pending_item = rumps.MenuItem(f"承認待ち: {self.pending_count}件")
+        # Pending count (dialog + deferred)
+        total_pending = self.pending_count + len(deferred_items)
+        pending_item = rumps.MenuItem(f"承認待ち: {total_pending}件")
         pending_item.set_callback(None)
         self.menu.add(pending_item)
 
@@ -179,6 +225,21 @@ class ClaudeGuardApp(rumps.App):
 
         self._rebuild_menu()
 
+    def _make_deferred_callback(self, request_id: str, decision: str):
+        """Create a callback for deferred approve/deny menu items."""
+        def callback(_):
+            self._resolve_deferred(request_id, decision)
+        return callback
+
+    def _resolve_deferred(self, request_id: str, decision: str):
+        """Resolve a deferred request from the menu bar."""
+        with self._deferred_lock:
+            req = self.deferred_requests.get(request_id)
+            if not req:
+                return
+            req["decision"] = decision
+            req["event"].set()  # Wake up the waiting thread
+
     def _is_autonomous(self) -> bool:
         """Check if autonomous mode is active."""
         return os.path.exists(self.AUTONOMOUS_FLAG)
@@ -195,7 +256,12 @@ class ClaudeGuardApp(rumps.App):
 
     def _update_title(self):
         """Update menu bar icon based on mode."""
-        self.title = "🛡⚡" if self._is_autonomous() else "🛡"
+        if self._is_autonomous():
+            self.title = "🛡⚡"
+        elif self.deferred_requests:
+            self.title = "🛡🔶"
+        else:
+            self.title = "🛡"
 
     def _open_config(self, _):
         """Open config.json in default editor."""
@@ -249,7 +315,8 @@ class ClaudeGuardApp(rumps.App):
 
     def _handle_connection(self, conn: socket.socket):
         """Handle a single client connection."""
-        conn.settimeout(60.0)
+        # Use a long timeout to accommodate deferred decisions
+        conn.settimeout(self.deferred_timeout + 30)
         try:
             buf = b""
             while True:
@@ -285,6 +352,7 @@ class ClaudeGuardApp(rumps.App):
                     )
                 finally:
                     self.pending_count = max(0, self.pending_count - 1)
+                    self._update_title()
 
                 # Record in history
                 if approved:
@@ -310,6 +378,10 @@ class ClaudeGuardApp(rumps.App):
                           msg: dict) -> tuple[bool, str]:
         """Process an approval request.
 
+        Shows a dialog first. If user clicks "後で", the request is deferred
+        to the menu bar for later decision. The calling thread blocks until
+        the user decides from the menu.
+
         Returns (approved, reason).
         """
         behavior = self.config.get("behavior", {})
@@ -322,16 +394,74 @@ class ClaudeGuardApp(rumps.App):
             timeout_action = behavior.get("timeout_action_high", "deny")
 
         # Show dialog
-        result, reason = show_approval_dialog(summary, risk, tool_name, timeout)
+        decision = show_approval_dialog(summary, risk, tool_name, timeout)
 
-        if result is None:
-            # Timeout
+        if decision == DECISION_APPROVE:
+            return True, "ユーザーにより承認されました"
+
+        if decision == DECISION_DENY:
+            return False, "ユーザーにより拒否されました"
+
+        if decision == DECISION_DEFER:
+            return self._handle_deferred(
+                summary, risk, tool_name, timeout_action,
+            )
+
+        # DECISION_TIMEOUT
+        if timeout_action == "approve":
+            return True, f"タイムアウト（{timeout}秒）- 自動承認"
+        else:
+            return False, f"タイムアウト（{timeout}秒）- 自動拒否"
+
+    def _handle_deferred(self, summary: str, risk: str, tool_name: str,
+                         timeout_action: str) -> tuple[bool, str]:
+        """Handle a deferred approval request.
+
+        Adds the request to the deferred queue and blocks until the user
+        decides from the menu bar, or the deferred timeout expires.
+
+        Returns (approved, reason).
+        """
+        request_id = str(uuid.uuid4())[:8]
+        event = threading.Event()
+
+        req = {
+            "summary": summary,
+            "risk": risk,
+            "tool_name": tool_name,
+            "event": event,
+            "decision": None,
+            "time": time.time(),
+        }
+
+        with self._deferred_lock:
+            self.deferred_requests[request_id] = req
+
+        self._update_title()
+        self._rebuild_menu()
+
+        # Block until user decides or timeout
+        resolved = event.wait(timeout=self.deferred_timeout)
+
+        # Clean up
+        with self._deferred_lock:
+            req = self.deferred_requests.pop(request_id, req)
+
+        self._update_title()
+        self._rebuild_menu()
+
+        if not resolved:
+            # Deferred timeout
             if timeout_action == "approve":
-                return True, f"タイムアウト（{timeout}秒）- 自動承認"
+                return True, f"保留タイムアウト（{self.deferred_timeout}秒）- 自動承認"
             else:
-                return False, f"タイムアウト（{timeout}秒）- 自動拒否"
+                return False, f"保留タイムアウト（{self.deferred_timeout}秒）- 自動拒否"
 
-        return result, reason
+        decision = req.get("decision")
+        if decision == DECISION_APPROVE:
+            return True, "メニューから承認されました"
+        else:
+            return False, "メニューから拒否されました"
 
 
 if __name__ == "__main__":
