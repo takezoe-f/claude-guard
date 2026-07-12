@@ -215,8 +215,10 @@ def classify_tool(tool_name: str, tool_input: dict) -> tuple[str, str]:
         command = tool_input.get("command", "")
         risk, matched_desc = classify_bash_command(command)
 
-        # Truncate command for display
-        cmd_short = command[:80] + ("..." if len(command) > 80 else "")
+        # Normalize whitespace for display: newlines break AppleScript dialogs
+        # and menu items, so collapse the command to a single line first
+        cmd_display = " ".join(command.split())
+        cmd_short = cmd_display[:80] + ("..." if len(cmd_display) > 80 else "")
 
         if risk == RISK_HIGH:
             summary = f"⚠️ コマンド実行: {cmd_short}（{matched_desc}）"

@@ -10,6 +10,7 @@ A rumps-based menu bar application that:
 
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
@@ -60,10 +61,15 @@ def show_approval_dialog(summary: str, risk: str, tool_name: str,
     """
     icon = "caution" if risk == RISK_HIGH else "note"
 
-    # Escape special characters for AppleScript string
+    # Escape special characters for AppleScript string.
+    # Newlines must be collapsed: a raw line break inside an AppleScript
+    # string literal is a syntax error, which would make osascript fail and
+    # silently fall through to the timeout action without showing a dialog.
     safe_summary = (summary
                     .replace("\\", "\\\\")
-                    .replace('"', '\\"'))
+                    .replace('"', '\\"')
+                    .replace("\r", " ")
+                    .replace("\n", " ⏎ "))
 
     risk_label = {"high": "高リスク", "medium": "中リスク", "low": "低リスク"}.get(risk, risk)
 
@@ -143,6 +149,13 @@ class ClaudeGuardApp(rumps.App):
         self.deferred_requests = {}
         self._deferred_lock = threading.Lock()
 
+        # UI dispatch queue: AppKit (menu/title) must only be touched from
+        # the main thread. Socket handler threads enqueue closures here and
+        # a rumps.Timer drains them on the main thread.
+        self._ui_queue = queue.Queue()
+        self._ui_timer = rumps.Timer(self._drain_ui_queue, 0.2)
+        self._ui_timer.start()
+
         # Build initial menu
         self._update_title()
         self._rebuild_menu()
@@ -150,6 +163,22 @@ class ClaudeGuardApp(rumps.App):
         # Start socket listener in background thread
         self.server_thread = threading.Thread(target=self._run_socket_server, daemon=True)
         self.server_thread.start()
+
+    def _ui(self, fn):
+        """Schedule a closure to run on the main thread (thread-safe)."""
+        self._ui_queue.put(fn)
+
+    def _drain_ui_queue(self, _):
+        """Run queued UI updates on the main thread (rumps.Timer callback)."""
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                pass
 
     def _rebuild_menu(self):
         """Rebuild the menu bar dropdown."""
@@ -349,26 +378,30 @@ class ClaudeGuardApp(rumps.App):
             if msg_type == MSG_LOG:
                 # Just log it
                 if risk != RISK_LOW or self.show_low_risk:
-                    icon = "✅"
-                    self._add_history_entry(icon, f"{summary} (自動承認)", risk)
+                    self._ui(lambda: self._add_history_entry(
+                        "✅", f"{summary} (自動承認)", risk))
 
             elif msg_type == MSG_REQUEST_APPROVAL:
-                self.pending_count += 1
-                self._rebuild_menu()
+                def _inc():
+                    self.pending_count += 1
+                    self._rebuild_menu()
+                self._ui(_inc)
 
                 try:
                     approved, reason = self._process_approval(
                         summary, risk, tool_name, msg,
                     )
                 finally:
-                    self.pending_count = max(0, self.pending_count - 1)
-                    self._update_title()
+                    def _dec():
+                        self.pending_count = max(0, self.pending_count - 1)
+                        self._update_title()
+                    self._ui(_dec)
 
                 # Record in history
-                if approved:
-                    self._add_history_entry("✅", f"{summary} (承認済み)", risk)
-                else:
-                    self._add_history_entry("❌", f"{summary} (拒否)", risk)
+                icon = "✅" if approved else "❌"
+                label = "承認済み" if approved else "拒否"
+                self._ui(lambda: self._add_history_entry(
+                    icon, f"{summary} ({label})", risk))
 
                 # Send response
                 response = {"approved": approved, "reason": reason}
@@ -447,8 +480,8 @@ class ClaudeGuardApp(rumps.App):
         with self._deferred_lock:
             self.deferred_requests[request_id] = req
 
-        self._update_title()
-        self._rebuild_menu()
+        self._ui(self._update_title)
+        self._ui(self._rebuild_menu)
 
         # Block until user decides or timeout
         resolved = event.wait(timeout=self.deferred_timeout)
@@ -457,8 +490,8 @@ class ClaudeGuardApp(rumps.App):
         with self._deferred_lock:
             req = self.deferred_requests.pop(request_id, req)
 
-        self._update_title()
-        self._rebuild_menu()
+        self._ui(self._update_title)
+        self._ui(self._rebuild_menu)
 
         if not resolved:
             # Deferred timeout

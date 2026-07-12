@@ -51,9 +51,13 @@ def approve():
 
 
 def block(reason: str):
-    """Exit with block, outputting JSON reason."""
-    result = {"decision": "block", "reason": reason}
-    print(json.dumps(result))
+    """Exit with block.
+
+    For PreToolUse hooks, exit code 2 blocks the tool call and stderr is fed
+    back to Claude as the reason. stdout is ignored on exit 2, so the reason
+    must go to stderr.
+    """
+    print(reason, file=sys.stderr)
     sys.exit(2)
 
 
