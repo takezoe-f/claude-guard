@@ -2,6 +2,8 @@
 
 macOSメニューバーからClaude Codeのツール実行を対話的に管理するアプリケーション。
 
+**[English README](README.md)**
+
 ## 概要
 
 Claude Codeはツール（Bash, Edit, Write等）を自動実行しますが、Claude Guardを使うことで：
