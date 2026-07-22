@@ -20,14 +20,25 @@ echo "✅ python3: $(python3 --version)"
 
 # 2. Install rumps
 # python3 -m pip で LaunchAgent が使う python3 と同じ環境に入れる。
-# Homebrew Python 3.12+ は externally-managed で通常の pip install を拒否するため、
-# 失敗時は --break-system-packages でリトライする（--user なのでシステムは汚さない）
+# - Python 3.9（macOS標準/CLT）: 最新の pyobjc は 3.10+ 専用でソースビルドに落ちて失敗するため、
+#   cp39 wheel が存在する pyobjc 10.3.2 を先に固定インストールする
+# - Homebrew Python 3.12+: externally-managed のため --break-system-packages でリトライ
+#   （--user なのでシステムは汚さない）
 echo "📦 rumps をインストール中..."
+# バージョン指定にスペースを含まないため文字列で持ち、展開はクォートしない
+# （macOS標準bash 3.2は set -u + 空配列展開でエラーになるため配列を使わない）
+PIN=""
+if python3 -c "import sys; sys.exit(0 if sys.version_info < (3, 10) else 1)"; then
+    echo "ℹ️  Python 3.9 環境を検出。pyobjc を 3.9 対応版（10.3.2）に固定します"
+    PIN="pyobjc-core==10.3.2 pyobjc-framework-Cocoa==10.3.2"
+    # 古い pip は yanked 版の pyobjc を誤って選ぶため先に更新する
+    python3 -m pip install --user --upgrade pip 2>/dev/null || true
+fi
 if python3 -c "import rumps" 2>/dev/null; then
     echo "✅ rumps は既にインストール済み"
-elif python3 -m pip install --user rumps; then
+elif python3 -m pip install --user $PIN rumps; then
     echo "✅ rumps インストール完了"
-elif python3 -m pip install --user --break-system-packages rumps; then
+elif python3 -m pip install --user --break-system-packages $PIN rumps; then
     echo "✅ rumps インストール完了（externally-managed 環境）"
 else
     echo "❌ rumps のインストールに失敗しました。上記のエラーを確認してください。"
