@@ -19,12 +19,20 @@ fi
 echo "✅ python3: $(python3 --version)"
 
 # 2. Install rumps
+# python3 -m pip で LaunchAgent が使う python3 と同じ環境に入れる。
+# Homebrew Python 3.12+ は externally-managed で通常の pip install を拒否するため、
+# 失敗時は --break-system-packages でリトライする（--user なのでシステムは汚さない）
 echo "📦 rumps をインストール中..."
-pip3 install rumps --quiet 2>/dev/null || {
-    echo "❌ rumps のインストールに失敗しました"
+if python3 -c "import rumps" 2>/dev/null; then
+    echo "✅ rumps は既にインストール済み"
+elif python3 -m pip install --user rumps; then
+    echo "✅ rumps インストール完了"
+elif python3 -m pip install --user --break-system-packages rumps; then
+    echo "✅ rumps インストール完了（externally-managed 環境）"
+else
+    echo "❌ rumps のインストールに失敗しました。上記のエラーを確認してください。"
     exit 1
-}
-echo "✅ rumps インストール完了"
+fi
 
 # 3. Make scripts executable
 chmod +x "$GUARD_DIR/hook-client.py"
