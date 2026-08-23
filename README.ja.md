@@ -273,6 +273,16 @@ launchctl list | grep claude.guard
 bash uninstall.sh
 ```
 
+## テスト
+
+```bash
+python3 tests/test_risk_classifier.py
+python3 tests/test_session_state.py
+python3 tests/test_hook_client.py
+```
+
+`test_hook_client.py` は hook-client.py をサブプロセスとして実行し、`permissionDecision` を検証する。デーモン稼働中や自律実行モード中は、実際のダイアログが出てしまうケースを自動でスキップする。
+
 ## 依存関係
 
 - macOS

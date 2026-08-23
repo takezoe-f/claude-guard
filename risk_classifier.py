@@ -38,6 +38,13 @@ MCP_READONLY_PREFIXES = (
     "download_", "whoami", "check_", "inspect_", "view_",
 )
 
+# Read-only actions whose name doesn't lead with a read verb, so the prefix
+# rule alone would miss them (e.g. Pencil's batch_get).
+MCP_READONLY_ACTIONS = frozenset({
+    "batch_get", "find", "whoami", "tabs_context_mcp",
+    "shortcuts_list", "list_connected_browsers",
+})
+
 # Tools that always require explicit approval
 ALWAYS_HIGH_TOOLS = frozenset({
     "mcp__freee-mcp__freee_api_post",
@@ -317,7 +324,8 @@ def _is_mcp_readonly(tool_name: str) -> bool:
     if len(parts) < 3:
         return False
     action = parts[2].lower()
-    return action.startswith(MCP_READONLY_PREFIXES)
+    return (action in MCP_READONLY_ACTIONS
+            or action.startswith(MCP_READONLY_PREFIXES))
 
 
 def _summarize_mcp_tool(tool_name: str, tool_input: dict) -> str:
