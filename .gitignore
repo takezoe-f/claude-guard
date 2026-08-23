@@ -3,4 +3,5 @@ __pycache__/
 *.pyo
 guard.sock
 autonomous.flag
+sessions/
 .DS_Store

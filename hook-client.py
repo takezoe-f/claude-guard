@@ -4,9 +4,17 @@
 Called by Claude Code's PreToolUse hook. Reads tool execution JSON from stdin,
 classifies risk, and communicates with the Claude Guard daemon for approval.
 
-Exit codes:
-  0 = approved (or daemon unreachable in fail-open mode)
-  2 = blocked (with JSON reason on stdout)
+The decision is returned to Claude Code as a PreToolUse permissionDecision on
+stdout. This matters: exiting 0 with no output means "the hook had no opinion",
+which leaves Claude Code's own permission prompt in place — so the user would
+be asked twice, once by Claude Guard's dialog and once by Claude Code's raw
+prompt. Emitting "allow"/"deny" makes Claude Guard the single place a decision
+is made.
+
+Three outcomes:
+  allow       — Claude Code runs the tool without prompting
+  deny        — Claude Code blocks the tool and tells Claude why
+  passthrough — Claude Guard abstains; Claude Code's normal prompt appears
 """
 
 import json
@@ -18,6 +26,7 @@ import uuid
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
+import session_state
 from ipc_protocol import (
     MSG_LOG, MSG_REQUEST_APPROVAL,
     create_message, send_to_daemon, is_daemon_running,
@@ -45,25 +54,51 @@ def load_config() -> dict:
         }
 
 
-def approve():
-    """Exit with approval (no output needed for approve)."""
+def _emit(decision: str, reason: str):
+    """Print a PreToolUse hook decision and exit."""
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        },
+    }, ensure_ascii=False))
     sys.exit(0)
 
 
-def block(reason: str):
-    """Exit with block.
+def allow(reason: str = "Claude Guard により承認されました"):
+    """Approve the tool call outright — no prompt from Claude Code."""
+    _emit("allow", reason)
 
-    For PreToolUse hooks, exit code 2 blocks the tool call and stderr is fed
-    back to Claude as the reason. stdout is ignored on exit 2, so the reason
-    must go to stderr.
+
+def deny(reason: str):
+    """Block the tool call, telling Claude the reason."""
+    _emit("deny", reason)
+
+
+def passthrough():
+    """Abstain, leaving Claude Code's own permission prompt in charge.
+
+    Used when Claude Guard cannot make an informed decision (daemon down,
+    plan mode, unparseable input). Never silently permits anything.
     """
-    print(reason, file=sys.stderr)
-    sys.exit(2)
+    sys.exit(0)
 
 
 def is_autonomous_mode() -> bool:
     """Check if autonomous mode is active (flag file exists)."""
     return os.path.exists(os.path.join(SCRIPT_DIR, "autonomous.flag"))
+
+
+def log_to_daemon(tool_name: str, summary: str, risk: str, tool_input: dict):
+    """Fire-and-forget history entry for the menu bar."""
+    if not is_daemon_running():
+        return
+    msg = create_message(MSG_LOG, tool_name, summary, risk, tool_input)
+    try:
+        send_to_daemon(msg, timeout=1.0)
+    except Exception:
+        pass
 
 
 def main():
@@ -72,8 +107,9 @@ def main():
     except SystemExit:
         raise
     except Exception:
-        # Any uncaught exception → fail-open (never block Claude Code due to our bugs)
-        approve()
+        # Any uncaught exception → hand back to Claude Code's own prompt
+        # rather than approving on our behalf.
+        passthrough()
 
 
 def _main():
@@ -82,76 +118,69 @@ def _main():
         raw = sys.stdin.read()
         hook_input = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        # Can't parse input, fail open
-        approve()
+        # Can't parse input — no basis for a decision
+        passthrough()
 
     tool_name = hook_input.get("tool_name", "")
     tool_input = hook_input.get("tool_input", {})
+    session_id = hook_input.get("session_id", "")
+    cwd = hook_input.get("cwd", "")
+    permission_mode = hook_input.get("permission_mode", "")
 
     if not tool_name:
-        approve()
+        passthrough()
+
+    # Plan mode restricts tools on purpose, and bypassPermissions already
+    # skips prompting. In both cases Claude Guard should stay out of the way
+    # rather than override Claude Code's own rules.
+    if permission_mode in ("plan", "bypassPermissions"):
+        passthrough()
 
     config = load_config()
 
     # Autonomous mode: auto-approve everything, just log
     if is_autonomous_mode():
         risk, summary = classify_tool(tool_name, tool_input)
-        if is_daemon_running():
-            msg = create_message(MSG_LOG, tool_name, summary + " (自律実行)", risk, tool_input)
-            try:
-                send_to_daemon(msg, timeout=1.0)
-            except Exception:
-                pass
-        approve()
+        log_to_daemon(tool_name, summary + " (自律実行)", risk, tool_input)
+        allow("自律実行モードのため自動承認")
 
     # Check if tool is in auto-approve list
-    auto_approve = config.get("auto_approve_tools", [])
-    if tool_name in auto_approve:
+    if tool_name in config.get("auto_approve_tools", []):
         risk, summary = classify_tool(tool_name, tool_input)
-        # Send log to daemon (non-blocking)
-        if is_daemon_running():
-            msg = create_message(MSG_LOG, tool_name, summary, risk, tool_input)
-            try:
-                send_to_daemon(msg, timeout=1.0)
-            except Exception:
-                pass
-        approve()
+        log_to_daemon(tool_name, summary, risk, tool_input)
+        allow("自動承認リストに登録されたツール")
 
     # Classify risk
     risk, summary = classify_tool(tool_name, tool_input)
 
     # Check if tool always requires approval
-    always_require = config.get("always_require_approval_tools", [])
-    if tool_name in always_require:
+    if tool_name in config.get("always_require_approval_tools", []):
         risk = RISK_HIGH
 
-    # Determine timeout based on risk
-    behavior = config.get("behavior", {})
-
     if risk == RISK_LOW:
-        # Low risk: auto-approve, just log
-        if is_daemon_running():
-            msg = create_message(MSG_LOG, tool_name, summary, risk, tool_input)
-            try:
-                send_to_daemon(msg, timeout=1.0)
-            except Exception:
-                pass
-        approve()
+        # Low risk: nothing outside Claude Code changes — approve and log
+        log_to_daemon(tool_name, summary, risk, tool_input)
+        allow("低リスク（読み取り系）のため自動承認")
 
-    elif risk == RISK_MEDIUM:
+    # A session-wide grant from an earlier dialog. Deliberately capped at the
+    # granted ceiling, so "全部許可" never covers rm -rf / git push / sudo.
+    if session_state.allows(session_id, risk):
+        log_to_daemon(tool_name, summary + " (セッション許可)", risk, tool_input)
+        allow("このセッションで全部許可が選択されています")
+
+    behavior = config.get("behavior", {})
+    if risk == RISK_MEDIUM:
         timeout = behavior.get("medium_risk_timeout_seconds", 15)
-        timeout_action = behavior.get("timeout_action_medium", "approve")
     else:  # RISK_HIGH
         timeout = behavior.get("high_risk_timeout_seconds", 30)
-        timeout_action = behavior.get("timeout_action_high", "deny")
 
-    # Check if daemon is running
+    # No daemon means no dialog to show. Fall back to Claude Code's own
+    # prompt — worse wording, but the user still gets a say.
     if not is_daemon_running():
-        # Daemon not running → fail-open (never block without a daemon to ask)
-        approve()
+        passthrough()
 
-    # Send approval request to daemon
-    # Use a long timeout to accommodate deferred decisions from menu bar
+    # Send approval request to daemon.
+    # Use a long timeout to accommodate deferred decisions from menu bar.
     deferred_timeout = behavior.get("deferred_timeout_seconds", 600)
     socket_timeout = float(max(timeout, deferred_timeout) + 10)
 
@@ -160,18 +189,20 @@ def _main():
         MSG_REQUEST_APPROVAL, tool_name, summary, risk,
         tool_input, request_id,
     )
+    msg["session_id"] = session_id
+    msg["cwd"] = cwd
 
     response = send_to_daemon(msg, timeout=socket_timeout)
 
     if response is None:
-        # Daemon didn't respond → fail-open
-        approve()
+        # Daemon accepted the request but never answered — don't guess.
+        passthrough()
 
+    reason = response.get("reason", "")
     if response.get("approved", False):
-        approve()
+        allow(f"Claude Guard: {reason}" if reason else "Claude Guard により承認")
     else:
-        reason = response.get("reason", "ユーザーにより拒否されました")
-        block(f"Claude Guard: {reason}")
+        deny(f"Claude Guard: {reason or 'ユーザーにより拒否されました'}")
 
 
 if __name__ == "__main__":

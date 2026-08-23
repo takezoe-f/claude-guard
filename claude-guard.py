@@ -24,11 +24,13 @@ sys.path.insert(0, SCRIPT_DIR)
 
 import rumps
 
+import session_state
 from ipc_protocol import (
     SOCKET_PATH, MSG_LOG, MSG_REQUEST_APPROVAL,
     RISK_LOW, RISK_MEDIUM, RISK_HIGH,
     encode_message, decode_message,
 )
+from risk_classifier import describe_tool
 
 # --- Configuration ---
 
@@ -44,41 +46,94 @@ def load_config() -> dict:
 # --- osascript Dialog ---
 
 DECISION_APPROVE = "approve"
+DECISION_SESSION = "session"
 DECISION_DENY = "deny"
 DECISION_DEFER = "defer"
 DECISION_TIMEOUT = "timeout"
 
+BUTTON_DENY = "拒否"
+BUTTON_ONCE = "今回だけ許可"
+BUTTON_SESSION = "全部許可"
+BUTTON_DEFER = "後で"
 
-def show_approval_dialog(summary: str, risk: str, tool_name: str,
-                         timeout_seconds: int) -> str:
+RISK_LABELS = {RISK_HIGH: "高リスク", RISK_MEDIUM: "中リスク", RISK_LOW: "低リスク"}
+
+
+def _escape_applescript(text: str) -> str:
+    """Escape a Python string for embedding in an AppleScript string literal.
+
+    A raw line break inside an AppleScript string literal is a syntax error,
+    so newlines are turned into the two-character escape \\n which AppleScript
+    itself resolves back to a line break.
+    """
+    return (text
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\n", "\\n"))
+
+
+def build_dialog_text(description: dict, risk: str) -> str:
+    """Lay out the plain-Japanese body of the approval dialog.
+
+    Shape:
+        何をしようとしているか        <- headline
+        (blank)
+        対象: ...                     <- the specifics
+        コマンド: ...
+        (blank)
+        理由: なぜ確認しているか
+    """
+    lines = [description.get("headline", "ツールを実行します"), ""]
+
+    for label, value in description.get("fields", []):
+        if value:
+            lines.append(f"{label}: {value}")
+
+    reason = description.get("reason", "")
+    if reason:
+        lines.append("")
+        prefix = "⚠️ " if risk == RISK_HIGH else ""
+        lines.append(f"{prefix}理由: {reason}")
+
+    return "\n".join(lines)
+
+
+def show_approval_dialog(description: dict, risk: str, tool_name: str,
+                         timeout_seconds: int,
+                         allow_session: bool = True) -> str:
     """Show a native macOS approval dialog using osascript.
 
     Uses 'tell current application' instead of 'tell application "System Events"'
-    to avoid freezing issues. Falls back to DECISION_TIMEOUT on any error
-    (crash, force-quit, kill) to maintain fail-open behavior.
+    to avoid freezing issues. Falls back to DECISION_TIMEOUT on any unexpected
+    error (crash, force-quit, kill) to maintain fail-open behavior.
 
-    Returns one of: DECISION_APPROVE, DECISION_DENY, DECISION_DEFER, DECISION_TIMEOUT.
+    macOS dialogs allow at most three buttons, so the third slot is either the
+    session-wide grant (medium risk) or the defer action (high risk, where a
+    blanket grant must never be offered).
+
+    Returns one of: DECISION_APPROVE, DECISION_SESSION, DECISION_DENY,
+    DECISION_DEFER, DECISION_TIMEOUT.
     """
     icon = "caution" if risk == RISK_HIGH else "note"
 
-    # Escape special characters for AppleScript string.
-    # Newlines must be collapsed: a raw line break inside an AppleScript
-    # string literal is a syntax error, which would make osascript fail and
-    # silently fall through to the timeout action without showing a dialog.
-    safe_summary = (summary
-                    .replace("\\", "\\\\")
-                    .replace('"', '\\"')
-                    .replace("\r", " ")
-                    .replace("\n", " ⏎ "))
+    if allow_session:
+        third, default_button = BUTTON_SESSION, BUTTON_ONCE
+    else:
+        third, default_button = BUTTON_DEFER, BUTTON_DENY
 
-    risk_label = {"high": "高リスク", "medium": "中リスク", "low": "低リスク"}.get(risk, risk)
+    body = _escape_applescript(build_dialog_text(description, risk))
+    risk_label = RISK_LABELS.get(risk, risk)
+    title = _escape_applescript(f"Claude Guard・{risk_label}（{tool_name}）")
 
     applescript = f'''
     tell current application
-        set dialogResult to display dialog "【{risk_label}】{safe_summary}" ¬
-            buttons {{"拒否", "後で", "承認"}} ¬
-            default button "承認" ¬
-            with title "Claude Guard - {tool_name}" ¬
+        set dialogResult to display dialog "{body}" ¬
+            buttons {{"{BUTTON_DENY}", "{BUTTON_ONCE}", "{third}"}} ¬
+            default button "{default_button}" ¬
+            cancel button "{BUTTON_DENY}" ¬
+            with title "{title}" ¬
             with icon {icon} ¬
             giving up after {timeout_seconds}
         if gave up of dialogResult then
@@ -95,18 +150,24 @@ def show_approval_dialog(summary: str, risk: str, tool_name: str,
             capture_output=True, text=True, timeout=timeout_seconds + 5,
         )
 
-        output = result.stdout.strip()
-
         if result.returncode != 0:
-            # Dialog was force-quit, killed, or crashed.
-            # Treat as timeout (fail-open) rather than explicit deny.
+            # A cancel button (拒否 / Esc) surfaces as AppleScript error -128,
+            # which is a real decision and must not be mistaken for a crash.
+            stderr = result.stderr or ""
+            if "-128" in stderr or "User canceled" in stderr:
+                return DECISION_DENY
+            # Dialog was force-quit, killed, or crashed → treat as timeout.
             return DECISION_TIMEOUT
 
-        if output == "承認":
+        output = result.stdout.strip()
+
+        if output == BUTTON_ONCE:
             return DECISION_APPROVE
-        if output == "後で":
+        if output == BUTTON_SESSION:
+            return DECISION_SESSION
+        if output == BUTTON_DEFER:
             return DECISION_DEFER
-        if output == "拒否":
+        if output == BUTTON_DENY:
             return DECISION_DENY
         if output == "timeout":
             return DECISION_TIMEOUT
@@ -140,6 +201,13 @@ class ClaudeGuardApp(rumps.App):
         self.show_low_risk = self.config.get("ui", {}).get("show_low_risk_in_menu", False)
         self.deferred_timeout = self.config.get("behavior", {}).get(
             "deferred_timeout_seconds", 600,
+        )
+
+        session_cfg = self.config.get("session_allow", {})
+        self.session_allow_enabled = session_cfg.get("enabled", True)
+        self.session_allow_max_risk = session_cfg.get("max_risk", RISK_MEDIUM)
+        self.session_allow_ttl = session_cfg.get(
+            "ttl_seconds", session_state.DEFAULT_TTL_SECONDS,
         )
 
         # Deferred requests: request_id -> {
@@ -213,6 +281,31 @@ class ClaudeGuardApp(rumps.App):
 
             self.menu.add(rumps.separator)
 
+        # Session-wide grants section
+        grants = session_state.list_active()
+        if grants:
+            ceiling = RISK_LABELS.get(self.session_allow_max_risk, "中リスク")
+            grants_header = rumps.MenuItem(
+                f"--- セッション全許可 ({len(grants)}件・{ceiling}まで) ---")
+            grants_header.set_callback(None)
+            self.menu.add(grants_header)
+
+            for grant in grants:
+                sid = grant.get("session_id", "")
+                label = os.path.basename(grant.get("cwd", "")) or sid[:8]
+                elapsed = int((time.time() - grant.get("granted_at", 0)) / 60)
+                parent = rumps.MenuItem(f"🔓 {label}（{elapsed}分前〜）")
+                parent.set_callback(None)
+                parent.add(rumps.MenuItem(
+                    "🔒 このセッションの全許可を解除",
+                    callback=self._make_revoke_callback(sid),
+                ))
+                self.menu.add(parent)
+
+            self.menu.add(rumps.MenuItem(
+                "🔒 全許可をすべて解除", callback=self._revoke_all_grants))
+            self.menu.add(rumps.separator)
+
         # History header
         header = rumps.MenuItem("--- 最近のツール実行 ---")
         header.set_callback(None)
@@ -279,6 +372,20 @@ class ClaudeGuardApp(rumps.App):
             req["decision"] = decision
             req["event"].set()  # Wake up the waiting thread
 
+    def _make_revoke_callback(self, session_id: str):
+        """Create a callback that revokes one session-wide grant."""
+        def callback(_):
+            session_state.revoke(session_id)
+            self._update_title()
+            self._rebuild_menu()
+        return callback
+
+    def _revoke_all_grants(self, _):
+        """Revoke every session-wide grant."""
+        session_state.revoke_all()
+        self._update_title()
+        self._rebuild_menu()
+
     def _is_autonomous(self) -> bool:
         """Check if autonomous mode is active."""
         return os.path.exists(self.AUTONOMOUS_FLAG)
@@ -299,6 +406,8 @@ class ClaudeGuardApp(rumps.App):
             self.title = "🛡⚡"
         elif self.deferred_requests:
             self.title = "🛡🔶"
+        elif session_state.list_active():
+            self.title = "🛡🔓"
         else:
             self.title = "🛡"
 
@@ -436,11 +545,38 @@ class ClaudeGuardApp(rumps.App):
             timeout = behavior.get("high_risk_timeout_seconds", 30)
             timeout_action = behavior.get("timeout_action_high", "deny")
 
-        # Show dialog
-        decision = show_approval_dialog(summary, risk, tool_name, timeout)
+        session_id = msg.get("session_id", "")
+        cwd = msg.get("cwd", "")
+
+        # A blanket grant is only ever offered for medium risk, and only when
+        # we have a session to scope it to. High-risk calls keep asking.
+        allow_session = (
+            risk != RISK_HIGH
+            and bool(session_id)
+            and self.session_allow_enabled
+        )
+
+        description = describe_tool(tool_name, msg.get("tool_input", {}), cwd)
+        decision = show_approval_dialog(
+            description, risk, tool_name, timeout, allow_session,
+        )
 
         if decision == DECISION_APPROVE:
             return True, "ユーザーにより承認されました"
+
+        if decision == DECISION_SESSION:
+            granted = session_state.grant(
+                session_id,
+                max_risk=self.session_allow_max_risk,
+                ttl_seconds=self.session_allow_ttl,
+                cwd=cwd,
+            )
+            self._ui(self._update_title)
+            self._ui(self._rebuild_menu)
+            if granted:
+                ceiling = RISK_LABELS.get(self.session_allow_max_risk, "中リスク")
+                return True, f"このセッションは{ceiling}まで自動許可に設定されました"
+            return True, "ユーザーにより承認されました（セッション設定の保存に失敗）"
 
         if decision == DECISION_DENY:
             return False, "ユーザーにより拒否されました"
