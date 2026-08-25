@@ -7,9 +7,15 @@
     "timeout_action_high": "deny",
     "deferred_timeout_seconds": 600
   },
+  "session_allow": {
+    "enabled": true,
+    "max_risk": "medium",
+    "ttl_seconds": 43200
+  },
   "auto_approve_tools": [
     "Read", "Glob", "Grep", "WebSearch", "WebFetch",
-    "TaskList", "TaskGet", "TaskOutput", "ToolSearch"
+    "TaskList", "TaskGet", "TaskOutput", "ToolSearch",
+    "TodoWrite", "AskUserQuestion", "Skill"
   ],
   "always_require_approval_tools": [
     "mcp__freee-mcp__freee_api_post",

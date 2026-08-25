@@ -20,16 +20,20 @@ Claude Codeはツール（Bash, Edit, Write等）を自動実行しますが、C
 Claude Code → PreToolUse Hook → hook-client.py → Unix Socket → claude-guard.py (メニューバー)
                                                                      ↓
                                                                osascript 承認ダイアログ
-                                                               [承認] [後で] [拒否]
+                                                        [拒否] [今回だけ許可] [全部許可]
                                                                      ↓
-Claude Code ← hook応答 ← hook-client.py ← Unix Socket ← ユーザーの判断
+Claude Code ← permissionDecision ← hook-client.py ← Unix Socket ← ユーザーの判断
 ```
+
+hookは `permissionDecision` (`allow` / `deny`) をstdoutで返すため、**Claude Code標準の確認プロンプトは表示されない**。Claude Guardのダイアログが唯一の判断ポイントになる。
+
+判断できない場合（デーモン停止、planモード、入力パース失敗）は何も出力せず終了し、Claude Code標準プロンプトに委ねる。勝手に承認はしない。
 
 ## リスク分類
 
 | レベル | ツール例 | 動作 |
 |--------|----------|------|
-| 低 | Read, Glob, Grep, WebSearch | 自動承認 |
+| 低 | Read, Glob, Grep, WebSearch, TodoWrite, 読み取り系MCP（`get_*` `list_*` `search_*` 等） | 自動承認（プロンプトなし） |
 | 中 | Edit, Write, npm install, git commit | ダイアログ表示、15秒タイムアウト→自動承認 |
 | 高 | rm -rf, git push, sudo, freee API書き込み | ダイアログ承認必須、30秒タイムアウト→自動拒否 |
 
@@ -47,15 +51,60 @@ bash -c "rm -rf dist/"
 
 ## 承認ダイアログ
 
-ダイアログには3つの選択肢：
+ツールが何をしようとしているかを、シェル構文を知らなくても読める日本語で表示する。
+
+```
+┌─ Claude Guard・中リスク（Write）──────────┐
+│ 既存ファイルを丸ごと上書きします           │
+│                                            │
+│ 対象: settings.json                        │
+│ 場所: ~/.claude                            │
+│ 分量: 約42行                               │
+│                                            │
+│ 理由: いまの内容が失われるため確認しています │
+│                                            │
+│        [拒否] [今回だけ許可] [全部許可]     │
+└────────────────────────────────────────────┘
+```
+
+- **headline** — 何をしようとしているか（「フォルダごとファイルを削除します」等）
+- **fields** — 対象ファイル / コマンド / 作業場所などの具体
+- **理由** — なぜ確認が入ったか、どう影響するか
+
+### ボタン
+
+macOSのダイアログはボタン最大3つ。3つ目はリスクによって入れ替わる。
+
+| リスク | ボタン構成 | 既定ボタン |
+|--------|------------|-----------|
+| 中 | 拒否 / 今回だけ許可 / **全部許可** | 今回だけ許可 |
+| 高 | 拒否 / 今回だけ許可 / **後で** | 拒否 |
+
+`Esc` は「拒否」に割り当て。
 
 | ボタン | 動作 |
 |--------|------|
-| **承認** | ツール実行を許可 |
+| **拒否** | ツール実行をブロック。理由がClaudeに伝わる |
+| **今回だけ許可** | この1回だけ実行を許可 |
+| **全部許可** | このセッションの中リスク以下を以後すべて自動許可（後述） |
 | **後で** | ダイアログを閉じ、メニューバーに保留。後からメニューで承認/拒否 |
-| **拒否** | ツール実行をブロック |
 
 保留中はメニューバーアイコンが 🛡🔶 に変化し、保留アイテムのサブメニューから承認/拒否が可能。保留タイムアウト（デフォルト600秒）後はconfig設定に従い自動判定。
+
+## セッション全許可
+
+「全部許可」を押すと、Claude Codeの `session_id` に紐づけて許可が記録される（`sessions/<id>.json`）。
+
+**スコープ:**
+- 対象は **中リスクまで**。`rm -rf` / `git push` / `sudo` / freee API書き込みなどの**高リスクは毎回ダイアログが出る**
+- **そのセッションのみ**。別ターミナルの別セッションには影響しない
+- デフォルト12時間で自動失効（`session_allow.ttl_seconds`）
+
+**解除:**
+- メニューバー 🛡🔓 →「🔒 このセッションの全許可を解除」/「🔒 全許可をすべて解除」
+- または `rm ~/.claude/tools/claude-guard/sessions/<session_id>.json`
+
+`session_allow.max_risk` を `"high"` にすると高リスクも含めて許可される（非推奨）。`enabled: false` で機能自体を無効化し、従来の「後で」ボタンに戻せる。
 
 ## 自律実行モード
 
@@ -74,18 +123,23 @@ bash -c "rm -rf dist/"
 - メニューバーの「✅ 自律実行モード (ON)」をクリック → OFF
 - またはスキル内で `rm ~/.claude/tools/claude-guard/autonomous.flag`
 
+**セッション全許可との違い:** 自律実行モードは**永続・全セッション・高リスク込み**。セッション全許可は**そのセッション限定・中リスクまで・12時間で失効**。日常作業では後者を使う。
+
 ## Fail-Open 設計
 
 **原則: Claude Guardの障害でClaude Codeが止まることはない**
 
 | シナリオ | 動作 |
 |----------|------|
-| デーモン未起動 | 全ツール自動承認 |
+| デーモン未起動 | Claude Code標準プロンプトに委ねる |
 | ダイアログがフリーズ/強制終了 | タイムアウトと同じ扱い（拒否にならない） |
-| hook-client.pyが例外で落ちる | 自動承認 (exit 0) |
-| ソケット通信失敗 | 自動承認 |
+| hook-client.pyが例外で落ちる | Claude Code標準プロンプトに委ねる |
+| ソケット通信失敗 | Claude Code標準プロンプトに委ねる |
+| planモード / bypassPermissions | 介入せずClaude Code側のルールに従う |
 
-「拒否」は明示的に「拒否」ボタンをクリックした時のみ発生。
+「拒否」は明示的に「拒否」ボタン（または `Esc`）を選んだ時のみ発生。
+
+なお「fail-open」は**無言で承認することではない**。Claude Guardが判断できない状況では確認の責任をClaude Codeに戻すため、ユーザーが何も知らないまま実行されることはない。
 
 ## 再起動ループ防止
 
@@ -141,6 +195,10 @@ launchctl list | grep claude.guard
   --- 保留中 (1件) ---
   🔶 ⚠️ rm -rf dist/ → [承認する] [拒否する]
   ---
+  --- セッション全許可 (1件・中リスクまで) ---
+  🔓 my-project（12分前〜） → [🔒 このセッションの全許可を解除]
+  🔒 全許可をすべて解除
+  ---
   --- 最近のツール実行 ---
   ✅ Read: main.ts (自動承認)
   ✅ Edit: config.json (承認済み)
@@ -168,9 +226,15 @@ launchctl list | grep claude.guard
     "timeout_action_high": "deny",
     "deferred_timeout_seconds": 600
   },
+  "session_allow": {
+    "enabled": true,
+    "max_risk": "medium",
+    "ttl_seconds": 43200
+  },
   "auto_approve_tools": [
     "Read", "Glob", "Grep", "WebSearch", "WebFetch",
-    "TaskList", "TaskGet", "TaskOutput", "ToolSearch"
+    "TaskList", "TaskGet", "TaskOutput", "ToolSearch",
+    "TodoWrite", "AskUserQuestion", "Skill"
   ],
   "always_require_approval_tools": [
     "mcp__freee-mcp__freee_api_post",
@@ -193,9 +257,11 @@ launchctl list | grep claude.guard
 ~/.claude/tools/claude-guard/
 ├── claude-guard.py        # メニューバーアプリ本体 (rumps)
 ├── hook-client.py         # PreToolUseフックスクリプト
-├── risk_classifier.py     # リスク分類 + 日本語要約（文字列コンテキスト認識）
+├── risk_classifier.py     # リスク分類 + 日本語要約・説明文生成
+├── session_state.py       # セッション全許可の記録/失効
 ├── ipc_protocol.py        # IPC定数・ヘルパー
 ├── config.json            # 設定ファイル
+├── sessions/              # セッション全許可の記録（gitignore）
 ├── install.sh             # インストールスクリプト
 ├── uninstall.sh           # アンインストール
 └── com.claude.guard.plist # LaunchAgent (ログイン時自動起動)
@@ -206,6 +272,16 @@ launchctl list | grep claude.guard
 ```bash
 bash uninstall.sh
 ```
+
+## テスト
+
+```bash
+python3 tests/test_risk_classifier.py
+python3 tests/test_session_state.py
+python3 tests/test_hook_client.py
+```
+
+`test_hook_client.py` は hook-client.py をサブプロセスとして実行し、`permissionDecision` を検証する。デーモン稼働中や自律実行モード中は、実際のダイアログが出てしまうケースを自動でスキップする。
 
 ## 依存関係
 
